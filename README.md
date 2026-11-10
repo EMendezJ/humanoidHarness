@@ -157,3 +157,8 @@ imprime el costo de cada llamada y el total de la sesión.
   marco del torso; faltaría usar el ángulo de cintura medido para "arriba" y para la superficie de apoyo.
 - Ajedrez (v2): tablero con AprilTags y homografía en vez de que Fable señale casillas, más python-chess para
   validar jugadas.
+
+## Licencia
+
+MIT, ver [`LICENSE`](LICENSE). Los modelos del G1 y de la Revo2 que se usan desde `xr_teleoperate` no forman parte
+de este repo y conservan sus propias licencias.
