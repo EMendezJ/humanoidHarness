@@ -3,8 +3,12 @@
 Arnés para que un LLM (Claude Fable 5.2) haga pick-and-place con un humanoide Unitree G1 Edu U7 y manos
 BrainCo Revo2 de 5 dedos, en simulación (MuJoCo) o en el robot real.
 
-Demo en simulación: [`docs/fable52_lata_vaso.mp4`](docs/fable52_lata_vaso.mp4). Instrucción: "Pon la lata verde y
-el vaso rojo dentro de la charola azul". Fable lo resolvió en 3 llamadas a la API, por ~$0.09.
+Demo en simulación: 
+
+
+https://github.com/user-attachments/assets/6e996c19-a172-460e-b80d-0ef071b1758a
+
+Instrucción: "Pon la lata verde y el vaso rojo dentro de la charola azul". Fable lo resolvió en 3 llamadas a la API, por ~$0.09.
 
 Fable 5.2 (`claude-fable-5-2`) ve la cámara de la cabeza y decide **qué** tomar y **dónde** dejarlo,
 señalando píxeles. El código local decide **cómo** moverse:
