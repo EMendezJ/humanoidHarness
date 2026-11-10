@@ -1,0 +1,9 @@
+# Laptop / simulation (tested: Python 3.10, anthropic 2.7.0, mujoco 3.17.0, pinocchio 3.1.0, numpy 1.26.4)
+anthropic>=2.7
+mujoco>=3.3          # MjSpec attach/delete API
+pin>=3.1             # pinocchio (or install pinocchio from conda-forge)
+numpy<2
+opencv-python
+pyzmq
+# Real robot: unitree_sdk2py (https://github.com/unitreerobotics/unitree_sdk2_python)
+# Jetson camera server (cam_server.py): pyrealsense2 (aarch64 cp310 wheel on PyPI), pyzmq, opencv-python
