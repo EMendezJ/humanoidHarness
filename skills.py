@@ -12,11 +12,19 @@ from kinematics import deproject, project, TCP_OFFSET
 from collision import SelfCollision
 from hand_model import revo2, OPEN as HAND_OPEN, PRESHAPE as HAND_PRESHAPE, CLOSED as HAND_CLOSE
 
-# Hand orientations tried in order: (finger tilt below horizontal, wrist yaw toward the body midline).
-# Turning the fingers toward the midline lets the elbow stay out when reaching across.
-ORIENTATIONS = [(p, y) for y in (0, 20, 40) for p in (35, 20, 10, 50, 0, 65)]
-MIN_GRASP_H = 0.04   # lowest TCP height tried above the support surface
-MAX_GRASP_H = 0.07   # preferred upper bound; raised up to the object's top if the hand needs room
+# Top-down grasp: palm facing down, the hand comes straight down over the object and the fingers and
+# thumb close around its upper part. Orientations tried in order: (finger tilt below horizontal, wrist yaw
+# toward the body midline). Turning the fingers toward the midline lets the elbow stay out.
+# "lado": palm facing the midline, the hand comes down beside the object's outer side and closes around
+# its middle (needs ~8 cm of height and free room on that side).
+ORIENTATIONS = {"arriba": [(p, y) for y in (0, 20, 40, -20) for p in (0, 15, 30)],
+                "lado": [(p, y) for y in (0, 20, 40) for p in (35, 20, 10, 50, 0, 65)]}
+GRASPS = tuple(ORIENTATIONS)
+# The tool point sits ~3.5 cm under the palm: it goes this far below the object's top (deepest first:
+# more of the object between the fingers), and never lower than MIN_GRASP_H above the support.
+GRASP_DEPTHS = (0.045, 0.035, 0.025)
+MIN_GRASP_H = 0.025
+SIDE_GRASP_H = (0.04, 0.07)  # side grasp: tool point height above the support (raised toward the top if needed)
 HAND_CLEARANCE = 0.01  # hand and carried object must stay this far above the table and other objects
 TRAVEL_EXTRA = (0.10, 0.15, 0.20)  # approach/lift heights tried, so a carried object clears tall neighbours
 CARRIED_RADIUS = 0.03  # carried object modelled as an upright cylinder hanging below the tool point
@@ -94,14 +102,20 @@ def annotate(rgb, marks=()):
 
 
 class Skills:
-    def __init__(self, robot, kin, table_z=None, max_qd=0.5, confirm=None, log=print):
+    def __init__(self, robot, kin, table_z=None, max_qd=0.5, confirm=None, log=print, arms=("left", "right"),
+                 segmenter=None):
         self.robot, self.kin = robot, kin
+        self.segmenter = segmenter      # segment.SegClient (SAM2) or None: then the clicked pixel's window is used
+        self.arms = tuple(arms)          # arms allowed to move; the others are never commanded
         self.table_z = table_z          # fallback support height when there is no depth
         self.max_qd = max_qd            # rad/s, joint-space speed limit of every motion
         self.confirm = confirm or (lambda text, img: (True, ""))
         self.log = log
         self.held = {"left": None, "right": None}
         self.collision = SelfCollision()
+        # Hull contacts of the pose the robot starts in (e.g. a hanging wrist against the hip hull) are
+        # real-world-safe: tolerated as long as a motion doesn't push them deeper.
+        self.rest_contacts = self.collision.contacts(robot.arm_q())
         # Revo2 surface points (open and closed) in the TCP frame, for clearance checks.
         self.hand_pts = {side: revo2(side).clearance_points() - TCP_OFFSET[side] for side in ("left", "right")}
         self.ready_q = {}
@@ -198,16 +212,19 @@ class Skills:
         return (self.kin.T_cam.rotation @ pc.T).T + self.kin.T_cam.translation
 
     def _arm_samples(self):
-        """Points along both forearms and hands (elbow to fingertips) at the current pose."""
+        """(points, radius) covering both arms (shoulder to wrist, 9 cm) and the whole hand surface
+        (6 cm around each surface point, whatever the wrist rotation; covers a marker stuck on it)."""
         q14 = self.robot.arm_q()
-        chain = []
+        chain, hand = [], []
         for side, sl in (("left", slice(0, 7)), ("right", slice(7, 14))):
             T = self.kin.fk(side, q14[sl])
-            joints = [self.kin.arm[side]["data"].oMi[j].translation.copy() for j in range(4, 8)]
-            pts = joints + [T.translation, T.act(np.array([0.08, 0.0, 0.0]))]
-            for a, b in zip(pts[:-1], pts[1:]):
+            joints = [self.kin.arm[side]["data"].oMi[j].translation.copy() for j in range(1, 8)]
+            for a, b in zip(joints[:-1], joints[1:]):
                 chain += [a + t * (b - a) for t in np.linspace(0, 1, 5)]
-        return np.array(chain)
+            hand.append((T.rotation @ self.hand_pts[side].T).T + T.translation)
+        # 6 cm around the hand also absorbs a few cm of camera miscalibration (the arm's own depth
+        # points must never become an obstacle in front of itself).
+        return [(np.array(chain), 0.09), (np.concatenate(hand), 0.06)]
 
     def _scene(self, depth, K, target=None, support=None, r=0.06):
         """Obstacle height maps from the depth image, without the robot's own arms and hands.
@@ -216,16 +233,64 @@ class Skills:
         if depth is None:
             flat = HeightMap(flat=self.table_z)
             return dict(hand=flat, obj=flat)
-        pts = self._cloud(depth, K)
-        keep = np.ones(len(pts), bool)
-        for c in self._arm_samples():
-            keep &= ((pts - c) ** 2).sum(1) > 0.09 ** 2
-        pts = pts[keep]
+        pts = self._without_arms(self._cloud(depth, K))
         if target is None:
             hm = HeightMap(pts)
             return dict(hand=hm, obj=hm)
         column = np.hypot(pts[:, 0] - target[0], pts[:, 1] - target[1]) < r
         return dict(hand=HeightMap(pts[~(column & (pts[:, 2] > support + 0.01))]), obj=HeightMap(pts[~column]))
+
+    def _mask_points(self, mask, depth, K, erode=3):
+        """Pelvis-frame points of the depth pixels inside MASK (eroded: edges carry mixed depths)."""
+        m = cv2.erode(mask.astype(np.uint8), np.ones((2 * erode + 1, 2 * erode + 1), np.uint8)) > 0
+        m &= (depth > 0.1) & (depth < 2.5)
+        vv, uu = np.nonzero(m)
+        z = depth[vv, uu]
+        pc = np.stack([(uu - K[0, 2]) / K[0, 0] * z, (vv - K[1, 2]) / K[1, 1] * z, z], 1)
+        return (self.kin.T_cam.rotation @ pc.T).T + self.kin.T_cam.translation
+
+    def _without_arms(self, pts):
+        """Drop the robot's own arms and hands, and any object hanging from a hand (held from its top, it
+        reaches well below the hand)."""
+        keep = np.ones(len(pts), bool)
+        for centres, radius in self._arm_samples():
+            for c in centres:
+                keep &= ((pts - c) ** 2).sum(1) > radius ** 2
+        q14 = self.robot.arm_q()
+        for side, sl in (("left", slice(0, 7)), ("right", slice(7, 14))):
+            if self.held.get(side):
+                tcp = self.kin.fk(side, q14[sl]).translation
+                below = self.held[side]["below"]
+                keep &= ~((np.hypot(pts[:, 0] - tcp[0], pts[:, 1] - tcp[1]) < CARRIED_RADIUS + 0.03)
+                          & (pts[:, 2] > tcp[2] - below - 0.02) & (pts[:, 2] < tcp[2] + 0.02))
+        return pts[keep]
+
+    def _object_geometry(self, pts, support):
+        """Upright object from its visible points: centre (x, y), radius, top. The camera sees only the
+        near side, so the centre is the nearest visible surface pushed back by the radius."""
+        pts = pts[pts[:, 2] > support + 0.01]
+        if len(pts) < 30:
+            return None
+        cam = self.kin.T_cam.translation
+        mid = np.median(pts[:, :2], axis=0)
+        view = mid - cam[:2]
+        view /= np.linalg.norm(view)
+        across = np.array([-view[1], view[0]])
+        a = pts[:, :2] @ across
+        lo, hi = np.percentile(a, 1), np.percentile(a, 99)
+        radius = float(np.clip((hi - lo) / 2 + 0.004, 0.01, 0.07))    # + the eroded mask border
+        near = np.percentile(pts[:, :2] @ view, 2)
+        centre = view * (near + radius) + across * (lo + hi) / 2
+        return dict(center=centre, radius=radius, top=float(np.percentile(pts[:, 2], 99)), n=len(pts))
+
+    def _segment(self, rgb, depth, K, u, v, support):
+        """SAM2 mask under (u, v) and the object geometry from it; (None, None) without a usable one."""
+        if self.segmenter is None or depth is None:
+            return None, None
+        mask, score = self.segmenter.mask(rgb, u, v)
+        if mask is None or score < 0.5:
+            return None, None
+        return mask, self._object_geometry(self._without_arms(self._mask_points(mask, depth, K)), support)
 
     # ================================================================ planning
     def _in_workspace(self, p):
@@ -260,6 +325,9 @@ class Skills:
         q14 = q14_start.copy()
         if static:
             segs = [[q14[sl].copy()]]
+        tolerate = dict(self.rest_contacts)
+        for pair, depth in self.collision.contacts(self.robot.arm_q()).items():
+            tolerate[pair] = min(depth, tolerate.get(pair, 0.0))
         ring = np.array([[CARRIED_RADIUS * np.cos(a), CARRIED_RADIUS * np.sin(a)] for a in np.linspace(0, 2 * np.pi, 8, endpoint=False)])
         for seg in segs:
             for q_next in seg:
@@ -267,7 +335,7 @@ class Skills:
                 n = max(1, int(np.ceil(np.max(np.abs(q_next - q_from)) / COLLISION_STEP)))
                 for s in np.linspace(1.0 / n, 1.0, n):
                     q14[sl] = q_from + s * (q_next - q_from)
-                    hits = self.collision.check(q14)
+                    hits = self.collision.check(q14, tolerate)
                     if hits:
                         a, b, d = hits[0]
                         raise SkillError(f"el brazo {side} chocaría consigo mismo ({a} contra {b}, {-d*100:.1f} cm)")
@@ -286,9 +354,13 @@ class Skills:
                             raise SkillError(f"el objeto en la mano {side} chocaría con algo en "
                                              f"x={at[0]:.2f} y={at[1]:+.2f} (margen {gap*100:+.1f} cm)")
 
-    def _grasp_rotation(self, side, pitch, yaw):
+    def _grasp_rotation(self, side, pitch, yaw, grasp="arriba"):
+        """Fingers forward, tilted `pitch` degrees down and turned `yaw` degrees toward the midline. The palm
+        faces the midline at the zero pose ("lado"); "arriba" rolls it 90° to face the table."""
         yaw_signed = np.radians(yaw) * (1.0 if side == "right" else -1.0)
-        return pin.rpy.rpyToMatrix(0, 0, yaw_signed) @ pin.rpy.rpyToMatrix(0, np.radians(pitch), 0)
+        roll = 0.0 if grasp == "lado" else np.radians(90.0) * (1.0 if side == "left" else -1.0)
+        return (pin.rpy.rpyToMatrix(0, 0, yaw_signed) @ pin.rpy.rpyToMatrix(0, np.radians(pitch), 0)
+                @ pin.rpy.rpyToMatrix(roll, 0, 0))
 
     def _safe_free(self, side, q14, q_goal, scene, carry, below):
         try:
@@ -299,7 +371,30 @@ class Skills:
             self._check(side, q14, [via], scene, carry, below)
             return via
 
-    def _plan(self, side, waypoints, scene=None, carry=None, below=0.0, end_ready=False):
+    def route(self, side, goal7, scene=None):
+        """Checked joint path from the current pose to goal7. Near the hip (an arm hanging or folded
+        down), a straight joint move can sweep the hand across the hip: then the shoulder first
+        abducts so the hand swings out, and on the way down the hand arrives from outside."""
+        q14 = self.robot.arm_q()
+        sl = slice(0, 7) if side == "left" else slice(7, 14)
+        out = 0.3 * (1.0 if side == "left" else -1.0)      # +shoulder_roll = abduct on the left arm
+        def abducted(q):
+            q = np.array(q, float).copy()
+            q[1] += out
+            return q
+        goal7 = np.asarray(goal7, float)
+        errors = []
+        for path in ([goal7], [abducted(q14[sl]), goal7], [abducted(goal7), goal7],
+                     [abducted(q14[sl]), abducted(goal7), goal7]):
+            try:
+                self._check(side, q14, [path], scene)
+                return [path]
+            except SkillError as e:
+                errors.append(e)
+        raise errors[0]
+
+    def _plan(self, side, waypoints, scene=None, carry=None, below=0.0, end_ready=False, orientations=None,
+              grasp="arriba"):
         """waypoints: list of (kind, xyz) with kind 'free' (joint move) or 'line' (straight).
         carry[i]: the hand holds the object while moving to waypoint i.
 
@@ -312,8 +407,8 @@ class Skills:
         q14_now = self.robot.arm_q()
         sl = slice(0, 7) if side == "left" else slice(7, 14)
         errors = []
-        for pitch, yaw in ORIENTATIONS:
-            R = self._grasp_rotation(side, pitch, yaw)
+        for pitch, yaw in (orientations or ORIENTATIONS[grasp]):
+            R = self._grasp_rotation(side, pitch, yaw, grasp)
             try:
                 q, keys = q14_now[sl], []
                 for (_, p), c in zip(waypoints, carry):
@@ -349,8 +444,8 @@ class Skills:
 
     def reach_report(self, p):
         out = []
-        for side in ("left", "right"):
-            q, err, _ = self.kin.ik(side, pin.SE3(pin.rpy.rpyToMatrix(0, np.radians(35), 0), p),
+        for side in self.arms:
+            q, err, _ = self.kin.ik(side, pin.SE3(self._grasp_rotation(side, *ORIENTATIONS["arriba"][0]), p),
                                     self._seeds(side, self.ready_q[side], p))
             out.append(f"{'izquierda' if side == 'left' else 'derecha'}: "
                        f"{'sí' if err < POS_TOL else f'no (le faltan {err*100:.0f} cm)'}")
@@ -358,7 +453,9 @@ class Skills:
 
     # ================================================================ execution
     def _arm_q14(self):
-        return self.robot.arm_q()
+        # Last commanded targets, not measured angles: re-commanding a sagging measured pose would
+        # let a holding arm creep down under gravity a little more on every motion.
+        return self.robot.arm_cmd()
 
     def _play(self, side, segs):
         q14 = self._arm_q14()
@@ -380,7 +477,11 @@ class Skills:
 
     def _pick_side(self, hand, p):
         if hand in ("left", "right"):
+            if hand not in self.arms:
+                raise SkillError(f"la mano {hand} está bloqueada en esta sesión; usa la mano {self.arms[0]}")
             return hand
+        if len(self.arms) == 1:
+            return self.arms[0]
         return "right" if p[1] < 0 else "left"
 
     # ================================================================ tools
@@ -404,20 +505,32 @@ class Skills:
                 f"El recorte ampliado x3 está centrado en la cruz magenta.")
         return text, [crop]
 
-    def pick(self, u, v, hand="auto", name="objeto"):
+    def pick(self, u, v, hand="auto", name="objeto", grasp="arriba"):
+        mode = grasp
+        if mode not in GRASPS:
+            raise SkillError(f"agarre '{mode}' desconocido; usa uno de {list(GRASPS)}")
         rgb, depth, K = self._frame()
         p, support, top, src = self.locate(u, v, depth, K)
         side = self._pick_side(hand, p)
         if self.held[side]:
             raise SkillError(f"la mano {side} ya sostiene '{self.held[side]['name']}'")
-        # The clicked point is on the side facing the camera: nudge toward the object's centre.
-        view = p - self.kin.T_cam.translation
-        view[2] = 0
-        c = p + 0.015 * view / max(np.linalg.norm(view), 1e-6)
+        mask, obj = self._segment(rgb, depth, K, u, v, support)
+        if obj is not None:
+            # SAM2: centre, radius and top from every visible point of the object (HomeBody-style).
+            c, radius, top, src = obj["center"], obj["radius"], obj["top"], f"SAM2, {obj['n']} puntos"
+            c = np.array([c[0], c[1], p[2]])
+        else:
+            # Fallback: the clicked point is on the side facing the camera, nudge toward the centre.
+            view = p - self.kin.T_cam.translation
+            view[2] = 0
+            c, radius = p + 0.015 * view / max(np.linalg.norm(view), 1e-6), 0.04
         h_obj = max(top - support, 0.02)
-        gz0 = support + float(np.clip(0.5 * h_obj, MIN_GRASP_H, MAX_GRASP_H))
-        heights = np.arange(gz0, max(gz0, top - 0.015) + 1e-6, 0.01)
-        scene = self._scene(depth, K, target=c, support=support)
+        if mode == "arriba":
+            heights = sorted({round(max(top - d, support + MIN_GRASP_H), 3) for d in GRASP_DEPTHS})
+        else:
+            gz0 = support + float(np.clip(0.5 * h_obj, *SIDE_GRASP_H))
+            heights = np.arange(gz0, max(gz0, top - 0.015) + 1e-6, 0.01)
+        scene = self._scene(depth, K, target=c, support=support, r=max(0.06, radius + 0.025))
         first_err, plan = None, None
         for gz in heights:
             for extra in TRAVEL_EXTRA:
@@ -425,41 +538,99 @@ class Skills:
                 try:
                     plan = self._plan(side, [("free", grasp + [0, 0, extra]), ("line", grasp),
                                              ("line", grasp + [0, 0, extra])],
-                                      scene=scene, carry=[False, False, True], below=gz - support)
+                                      scene=scene, carry=[False, False, True], below=gz - support, grasp=mode)
                     break
                 except SkillError as e:
                     first_err = first_err or e
             if plan:
                 break
         if plan is None:
-            if "tocaría" in str(first_err) and h_obj < 0.08:
+            if mode == "lado" and "tocaría" in str(first_err) and h_obj < 0.08:
                 raise SkillError(f"{first_err}: el objeto (~{h_obj*100:.0f} cm de alto) es muy bajo para el "
-                                 f"agarre lateral; se necesitan ~8 cm o más")
+                                 f"agarre de lado (~8 cm o más); prueba agarre='arriba'")
             raise first_err
         segs, (pitch, yaw) = plan
         summary = (f"PICK '{name}' con mano {side}: pixel ({u},{v}) -> agarre en "
                    f"x={grasp[0]:.3f} y={grasp[1]:+.3f} z={grasp[2]:+.3f} m (pelvis), "
-                   f"dedos {pitch}° abajo, {yaw}° hacia el centro, objeto ~{h_obj*100:.0f} cm [{src}]")
-        ok, note = self.confirm(summary, annotate(rgb, [(u, v, name)]))
+                   f"{'desde arriba (palma abajo' if mode == 'arriba' else 'de lado (palma hacia el centro'}, dedos {pitch}° abajo, "
+                   f"{yaw}° hacia el centro), objeto ~{h_obj*100:.0f} cm de alto y "
+                   f"~{radius*200:.0f} cm de ancho [{src}]")
+        marked = annotate(rgb, [(u, v, name)])
+        if mask is not None:
+            marked[mask] = (0.6 * marked[mask] + [0, 90, 0]).astype(np.uint8)
+        ok, note = self.confirm(summary, marked)
         if not ok:
             raise SkillError(f"el operador rechazó el movimiento{': ' + note if note else ''}")
         self.log(summary)
         self._hand(side, HAND_PRESHAPE, 0.5)
-        self._play(side, segs[:2])
+        self._play(side, segs[:1])                      # to the pre-grasp, above the object
+
+        # Look again from the pre-grasp and correct the target (HomeBody: re-observe before contact).
+        note_fix = ""
+        if mask is not None:
+            rgb2, depth2, K2 = self._frame()
+            pc = self.kin.pelvis_to_cam(np.array([c[0], c[1], support + 0.5 * h_obj]))
+            u2, v2 = project(pc, K2)
+            if 0 <= u2 < rgb2.shape[1] and 0 <= v2 < rgb2.shape[0]:
+                _, obj2 = self._segment(rgb2, depth2, K2, int(u2), int(v2), support)
+                if obj2 is not None:
+                    shift = np.linalg.norm(obj2["center"] - c[:2])
+                    if shift > 0.04:
+                        raise SkillError(f"el objeto se movió {shift*100:.0f} cm desde que lo vi; vuelve a mirar "
+                                         f"(la mano quedó arriba del lugar original)")
+                    if shift > 0.005:
+                        g2 = np.array([obj2["center"][0], obj2["center"][1], gz])
+                        try:
+                            scene2 = self._scene(depth2, K2, target=g2, support=support, r=max(0.06, radius + 0.025))
+                            segs2, _ = self._plan(side, [("line", g2), ("line", g2 + [0, 0, extra])],
+                                                  scene=scene2, carry=[False, True], below=gz - support,
+                                                  orientations=[(pitch, yaw)], grasp=mode)
+                            segs, grasp = segs[:1] + segs2, g2
+                            note_fix = f" Corregí el objetivo {shift*100:.1f} cm al volver a verlo desde arriba."
+                        except SkillError as e:
+                            if shift > 0.02:
+                                raise SkillError(f"el objeto está {shift*100:.0f} cm de donde lo vi y no puedo "
+                                                 f"corregir el agarre ({e}); la mano quedó arriba")
+                            note_fix = (f" Lo vi {shift*100:.1f} cm movido pero no pude corregir ({e}); "
+                                        f"seguí con el plan original.")
+                else:
+                    note_fix = " No pude volver a verlo desde arriba (la mano lo tapa); seguí con el plan original."
+        self._play(side, segs[1:2])                     # straight down beside the object
         self._hand(side, HAND_CLOSE, 1.0)
         state = self.robot.hand_state(side)
-        self._play(side, segs[2:])
+        self._play(side, segs[2:])                      # lift
         fingers = state[2:].mean()
         contact = fingers < 0.9 * HAND_CLOSE[2:].mean()
-        self.held[side] = dict(name=name, below=gz - support)
-        msg = (f"Mano {side} cerrada en x={grasp[0]:.3f} y={grasp[1]:+.3f} z={grasp[2]:+.3f} y levantada {extra*100:.0f} cm. "
-               f"Dedos en {fingers:.2f} (comando {HAND_CLOSE[2:].mean():.2f}): "
-               + ("hay contacto, probablemente lo sostiene." if contact else
-                  "los dedos cerraron casi por completo: probablemente NO agarró nada."))
+
+        # Lift check: is there still something standing where the object was?
+        still, left_behind = "", None
+        if mask is not None:
+            rgb3, depth3, K3 = self._frame()
+            pts = self._without_arms(self._cloud(depth3, K3))
+            near = np.hypot(pts[:, 0] - grasp[0], pts[:, 1] - grasp[1]) < radius
+            # Only below the lifted object's bottom (support + extra), which is still inside this column.
+            low = (pts[:, 2] > support + 0.02) & (pts[:, 2] < min(top + 0.01, support + extra - 0.015))
+            left_behind = int((near & low).sum())
+            if left_behind > 30:
+                still = f" La cámara todavía ve algo en su lugar ({left_behind} puntos): probablemente se quedó en la mesa."
+            else:
+                still = " Su lugar en la mesa quedó vacío."
+        # Held only if the fingers stopped on something and the camera does not still see it on the table.
+        held = contact and (left_behind is None or left_behind <= 30)
+        msg = (f"Mano {side} cerrada en x={grasp[0]:.3f} y={grasp[1]:+.3f} z={grasp[2]:+.3f} y levantada {extra*100:.0f} cm."
+               f"{note_fix} Dedos en {fingers:.2f} (comando {HAND_CLOSE[2:].mean():.2f}): "
+               + ("hay contacto." if contact else "los dedos cerraron casi por completo.") + still)
+        if held:
+            self.held[side] = dict(name=name, below=gz - support, grasp=mode)
+        else:
+            self._hand(side, HAND_OPEN, 0.5)
+            msg += f" AGARRE FALLIDO: abrí la mano; la mano {side} queda vacía y arriba del lugar del objeto."
         return msg, [self.look()]
 
     def place(self, u, v, hand="auto"):
-        sides = [s for s in ("left", "right") if self.held[s]] if hand == "auto" else [hand]
+        if hand != "auto" and hand not in self.arms:
+            raise SkillError(f"la mano {hand} está bloqueada en esta sesión")
+        sides = [s for s in self.arms if self.held[s]] if hand == "auto" else [hand]
         if not sides or not self.held[sides[0]]:
             raise SkillError("ninguna mano tiene un objeto que soltar" if hand == "auto"
                              else f"la mano {hand} no sostiene nada")
@@ -478,7 +649,8 @@ class Skills:
                 try:
                     plan = self._plan(side, [("free", target + [0, 0, extra]), ("line", target),
                                              ("line", target + [0, 0, extra])],
-                                      scene=scene, carry=[True, True, False], below=below, end_ready=True)
+                                      scene=scene, carry=[True, True, False], below=below, end_ready=True,
+                                      grasp=self.held[side].get("grasp", "arriba"))
                     break
                 except SkillError as e:
                     first_err = first_err or e
@@ -501,11 +673,12 @@ class Skills:
         return f"Soltó '{name}' en x={target[0]:.3f} y={target[1]:+.3f} y volvió a la pose de espera.", [self.look()]
 
     def home(self):
-        ok, note = self.confirm("HOME: ambos brazos a la pose de espera (manos arriba, fuera de la vista)",
+        which = "ambos brazos" if len(self.arms) == 2 else f"brazo {self.arms[0]}"
+        ok, note = self.confirm(f"HOME: {which} a la pose de espera (mano arriba, fuera de la vista)",
                                 annotate(self.look()))
         if not ok:
             raise SkillError(f"el operador rechazó el movimiento{': ' + note if note else ''}")
-        for side in ("left", "right"):
+        for side in self.arms:
             self._check(side, self.robot.arm_q(), [[self.ready_q[side]]], None)
             self._play(side, [[self.ready_q[side]]])
             if not self.held[side]:
@@ -514,5 +687,7 @@ class Skills:
 
     def status(self):
         def s(side):
+            if side not in self.arms:
+                return "bloqueada (no se mueve en esta sesión)"
             return f"sostiene '{self.held[side]['name']}'" if self.held[side] else "vacía"
         return f"Mano izquierda: {s('left')}. Mano derecha: {s('right')}."

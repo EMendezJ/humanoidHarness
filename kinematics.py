@@ -50,6 +50,16 @@ class G1Kinematics:
         pin.framesForwardKinematics(full, data, q0)
         T_link = data.oMf[full.getFrameId("d435_link")]
         self.T_cam = pin.SE3(T_link.rotation @ R_LINK_OPTICAL, T_link.translation.copy())
+        self.T_cam_nominal = self.T_cam.copy()
+        # Measured camera correction. FABLE_PICK_CAM_CALIB: a calib.py JSON (full 6-DoF fit from the hand
+        # marker, preferred). FABLE_PICK_CAM_OFFSET: a plain "dx,dy,dz" shift, used only without the JSON.
+        calib_path, off = os.environ.get("FABLE_PICK_CAM_CALIB"), os.environ.get("FABLE_PICK_CAM_OFFSET")
+        if calib_path and os.path.exists(calib_path):
+            import calib
+            rv, t = calib.load(calib_path)
+            self.T_cam = calib.corrected(self.T_cam_nominal, rv, t)
+        elif off:
+            self.T_cam.translation = self.T_cam.translation + np.array([float(v) for v in off.split(",")])
 
         self.arm = {}
         for side in ("left", "right"):

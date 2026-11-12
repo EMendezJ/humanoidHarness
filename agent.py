@@ -43,9 +43,12 @@ Límites físicos que conviene tener presentes:
 - Los brazos son cortos: solo alcanzan una franja de la mesa cercana al robot, más o menos la mitad \
 inferior de la imagen. La mano derecha trabaja del lado derecho de la imagen y la izquierda del lado \
 izquierdo; las dos llegan al centro. Si algo queda fuera de alcance, pide a la persona que lo acerque.
-- El agarre es de mano completa con la palma de lado, como para tomar una lata. Funciona con objetos de \
-unos 4 a 9 cm de ancho y al menos ~8 cm de alto; los planos o pequeños no se pueden tomar. La mano entra \
-por el lado exterior del objeto con los dedos hacia adelante, así que necesita espacio libre de ese lado. \
+- Hay dos agarres (parámetro grasp de pick). "arriba": la mano baja vertical con la palma hacia la mesa y \
+envuelve la parte de arriba del objeto; sirve para objetos de unos 3 a 8 cm de ancho y al menos ~4 cm de \
+alto. "lado": la palma de lado, como para tomar una lata; rodea el cuerpo del objeto por su lado exterior, \
+necesita objetos de al menos ~8 cm de alto y espacio libre de ese lado. Si la persona pide un agarre, usa \
+ese; si no, "arriba" para objetos bajos y cualquiera de los dos para los altos. Los muy planos no se pueden \
+tomar. Señala el centro del cuerpo del objeto. \
 Si el robot se niega a un movimiento porque chocaría con algo, propone otra mano, otro punto o pide ayuda.
 - Si ves manos o brazos de una persona cerca del objetivo, no muevas el brazo: avisa y espera.
 
@@ -56,9 +59,19 @@ Antes de cada acción física di en una frase corta qué vas a hacer. Habla en e
 
 XY = {"x": {"type": "integer", "description": "Columna del píxel, 0-639"},
       "y": {"type": "integer", "description": "Fila del píxel, 0-479"}}
-HAND = {"type": "string", "enum": ["auto", "left", "right"],
-        "description": "Mano a usar. auto = la del lado del objeto. Elige una explícitamente si el destino "
-                       "queda del otro lado."}
+ARMS_NOTE = {
+    ("left", "right"): "",
+    ("left",): "\n\nEn esta sesión solo se mueve la mano IZQUIERDA; la derecha está bloqueada y no se puede usar. "
+               "Trabaja con lo que alcance la mano izquierda (lado izquierdo y centro de la imagen).",
+    ("right",): "\n\nEn esta sesión solo se mueve la mano DERECHA; la izquierda está bloqueada y no se puede usar. "
+                "Trabaja con lo que alcance la mano derecha (lado derecho y centro de la imagen).",
+}
+
+
+def hand_schema(arms):
+    return {"type": "string", "enum": ["auto", *arms],
+            "description": "Mano a usar. auto = la del lado del objeto (o la única disponible). Elige una "
+                           "explícitamente si el destino queda del otro lado."}
 
 
 def _tool(name, description, props=None, required=()):
@@ -67,26 +80,34 @@ def _tool(name, description, props=None, required=()):
                              "additionalProperties": False}}
 
 
-TOOLS = [
-    _tool("look", "Toma una foto nueva de la cámara de la cabeza y reporta qué sostiene cada mano."),
-    _tool("inspect_point", "Muestra un recorte ampliado x3 alrededor de un píxel, con una cruz, y dice su "
-          "posición 3D, la altura del objeto y qué mano lo alcanza. No mueve el robot.",
-          XY, ["x", "y"]),
-    _tool("pick", "Agarra el objeto que está en ese píxel: abre la mano, baja desde arriba, cierra y lo "
-          "levanta 10 a 20 cm (más si hay objetos altos cerca). Regresa una foto nueva y si los dedos hicieron contacto.",
-          {**XY, "hand": HAND, "object": {"type": "string", "description": "Nombre corto del objeto"}},
-          ["x", "y", "hand", "object"]),
-    _tool("place", "Lleva el objeto sostenido sobre ese píxel, lo baja hasta la superficie, lo suelta y "
-          "regresa el brazo a la pose de espera. Regresa una foto nueva.",
-          {**XY, "hand": {**HAND, "description": "Mano que sostiene el objeto (auto = la que tenga algo)."}},
-          ["x", "y", "hand"]),
-    _tool("home", "Lleva ambos brazos a la pose de espera (manos arriba, fuera de la vista de la cámara)."),
-]
+def make_tools(arms):
+    HAND = hand_schema(arms)
+    return [
+        _tool("look", "Toma una foto nueva de la cámara de la cabeza y reporta qué sostiene cada mano."),
+        _tool("inspect_point", "Muestra un recorte ampliado x3 alrededor de un píxel, con una cruz, y dice su "
+              "posición 3D, la altura del objeto y qué mano lo alcanza. No mueve el robot.",
+              XY, ["x", "y"]),
+        _tool("pick", "Agarra el objeto que está en ese píxel: abre la mano, la lleva sobre el objeto, cierra y lo "
+              "levanta 10 a 20 cm (más si hay objetos altos cerca). Regresa una foto nueva y si los dedos hicieron contacto.",
+              {**XY, "hand": HAND, "object": {"type": "string", "description": "Nombre corto del objeto"},
+               "grasp": {"type": "string", "enum": ["arriba", "lado"],
+                         "description": "arriba: palma hacia la mesa, envuelve la parte de arriba del objeto. "
+                                        "lado: palma de lado, rodea el cuerpo del objeto por su lado exterior."}},
+              ["x", "y", "hand", "object", "grasp"]),
+        _tool("place", "Lleva el objeto sostenido sobre ese píxel, lo baja hasta la superficie, lo suelta y "
+              "regresa el brazo a la pose de espera. Regresa una foto nueva.",
+              {**XY, "hand": {**HAND, "description": "Mano que sostiene el objeto (auto = la que tenga algo)."}},
+              ["x", "y", "hand"]),
+        _tool("home", "Lleva los brazos disponibles a la pose de espera (manos arriba, fuera de la vista de la cámara)."),
+    ]
 
 
 class Session:
     def __init__(self, skills, effort, fast, run_dir, max_tokens=32000):
         self.skills, self.effort, self.fast = skills, effort, fast
+        # Fixed for the whole session (prompt cache + preserved thinking need an unchanged prefix).
+        self.system = SYSTEM + ARMS_NOTE[tuple(skills.arms)]
+        self.tools = make_tools(skills.arms)
         self.run_dir = run_dir
         self.max_tokens = max_tokens
         self.client = anthropic.Anthropic()
@@ -115,7 +136,7 @@ class Session:
         elif name == "inspect_point":
             text, images = sk.inspect_point(args["x"], args["y"])
         elif name == "pick":
-            text, images = sk.pick(args["x"], args["y"], args["hand"], args["object"])
+            text, images = sk.pick(args["x"], args["y"], args["hand"], args["object"], args.get("grasp", "arriba"))
             text += " " + sk.status()
         elif name == "place":
             text, images = sk.place(args["x"], args["y"], args["hand"])
@@ -147,8 +168,9 @@ class Session:
             self._image_block(self.skills.look()),
         ]})
         self._log(role="user", text=text)
+        self._feed("user", text)
         while True:
-            params = dict(model=MODEL, max_tokens=self.max_tokens, system=SYSTEM, tools=TOOLS,
+            params = dict(model=MODEL, max_tokens=self.max_tokens, system=self.system, tools=self.tools,
                           messages=self.messages, thinking={"type": "adaptive", "display": "summarized"},
                           output_config={"effort": self.effort}, cache_control={"type": "ephemeral"},
                           betas=[FALLBACK_BETA], fallbacks="default")
@@ -179,6 +201,7 @@ class Session:
                                     "content": "No se ejecutó: el operador detuvo el robot."})
                     continue
                 print(f"\033[36m→ {tu.name}({json.dumps(tu.input, ensure_ascii=False)})\033[0m")
+                self._feed("tool", f"{tu.name}(" + ", ".join(f"{k}={v}" for k, v in tu.input.items()) + ")", hold=False)
                 try:
                     content = self._run_tool(tu.name, tu.input)
                     results.append({"type": "tool_result", "tool_use_id": tu.id, "content": content})
@@ -200,6 +223,9 @@ class Session:
                     traceback.print_exc()
                     results.append({"type": "tool_result", "tool_use_id": tu.id,
                                     "content": f"falla interna del robot: {e}", "is_error": True})
+                r = results[-1]
+                self._feed("error" if r.get("is_error") else "result",
+                           r["content"] if isinstance(r["content"], str) else r["content"][0]["text"])
                 self._log(role="tool", name=tu.name, input=tu.input,
                           result=results[-1]["content"] if isinstance(results[-1]["content"], str)
                           else results[-1]["content"][0]["text"])
@@ -207,9 +233,15 @@ class Session:
             if stopped:
                 return
 
+    def _feed(self, kind, text, hold=True):
+        """Sim recordings: show it in the reasoning panel."""
+        robot = self.skills.robot
+        if hasattr(robot, "feed_add"):
+            robot.feed_add(kind, text, hold)
+
     def _stream(self, params):
         in_thinking = False
-        said = []
+        said, thought = [], []
         with self.client.beta.messages.stream(**params) as stream:
             for ev in stream:
                 if ev.type == "content_block_start" and ev.content_block.type == "fallback":
@@ -220,6 +252,7 @@ class Session:
                             print("\n\033[2m(pensando) ", end="")
                             in_thinking = True
                         print(ev.delta.thinking, end="", flush=True)
+                        thought.append(ev.delta.thinking)
                     elif ev.delta.type == "text_delta":
                         if in_thinking:
                             print("\033[0m")
@@ -229,8 +262,8 @@ class Session:
             if in_thinking:
                 print("\033[0m")
             msg = stream.get_final_message()
-        if said and hasattr(self.skills.robot, "subtitle"):
-            self.skills.robot.subtitle = "Fable: " + " ".join("".join(said).split())
+        self._feed("thinking", "".join(thought))
+        self._feed("said", "".join(said))
         self._account(msg)
         return msg
 
@@ -251,10 +284,12 @@ def make_confirm(view):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--backend", choices=["sim", "real"], default="sim")
-    ap.add_argument("--iface", default="enx0c37969f434c", help="interfaz cableada al robot (real)")
-    ap.add_argument("--cam-host", default="192.168.123.164", help="IP de la Jetson con cam_server.py")
+    ap.add_argument("--iface", default=os.environ.get("HH_IFACE", "enx0c37969f434c"), help="interfaz cableada al robot (real)")
+    ap.add_argument("--cam-host", default=os.environ.get("HH_CAM_HOST", "192.168.123.164"), help="IP de la Jetson con cam_server.py")
     ap.add_argument("--cam-port", type=int, default=55600)
     ap.add_argument("--no-hands", action="store_true", help="no mandar comandos a las BrainCo")
+    ap.add_argument("--arms", choices=["left", "right", "both"], default="both",
+                    help="brazos que se pueden mover; el otro queda bloqueado en su pose inicial")
     ap.add_argument("--table-z", type=float, help="altura de la mesa vs pelvis (m), si no hay depth")
     ap.add_argument("--speed", type=float, default=None, help="rad/s articular (sim 1.0, real 0.4)")
     ap.add_argument("--effort", default="high", choices=["low", "medium", "high", "xhigh", "max"])
@@ -263,12 +298,16 @@ def main():
     ap.add_argument("--confirm", action="store_true", help="pedir confirmación también en sim")
     ap.add_argument("--view", action="store_true", help="ventana con la imagen de cada movimiento")
     ap.add_argument("--viewer", action="store_true", help="visor MuJoCo (sim)")
-    ap.add_argument("--scene", default="lata_vaso", help="escena de la simulación: lata_vaso | lata_caja")
+    ap.add_argument("--scene", default="lata_vaso", help="escena de la simulación: recoger_mesa | lata_vaso | lata_caja | cilindro_azul | vacia")
     ap.add_argument("--record", help="sim: graba la sesión en este .mp4")
+    ap.add_argument("--seg-host", default=os.environ.get("HH_SEG_HOST"),
+                    help="host del servidor SAM2 (segment.py serve); sin esto el pick usa solo la depth del clic")
+    ap.add_argument("--seg-port", type=int, default=55610)
     ap.add_argument("--task", help="primera instrucción (si no, se pregunta)")
     a = ap.parse_args()
 
     kin = G1Kinematics()
+    arms = ("left", "right") if a.arms == "both" else (a.arms,)
     if a.backend == "sim":
         from robot_sim import SimRobot
         robot = SimRobot(kin, realtime=a.viewer, viewer=a.viewer, scene=a.scene)
@@ -278,14 +317,37 @@ def main():
         ask = a.confirm
     else:
         from robot_real import RealRobot
-        robot = RealRobot(a.iface, a.cam_host, a.cam_port, hands=not a.no_hands)
+        robot = RealRobot(a.iface, a.cam_host, a.cam_port, hands=not a.no_hands, arms=arms)
         speed = a.speed or 0.4
         ask = not a.auto
     confirm = make_confirm(a.view) if ask else None
     def log(s):
         print(f"\033[35m{s}\033[0m")
         robot.caption = s           # shown in sim recordings
-    skills = Skills(robot, kin, table_z=a.table_z, max_qd=speed, confirm=confirm, log=log)
+    segmenter = None
+    if a.seg_host:
+        from segment import SegClient
+        segmenter = SegClient(a.seg_host, a.seg_port)
+        if segmenter.ping():
+            print(f"SAM2: tcp://{a.seg_host}:{a.seg_port}")
+        else:
+            print(f"\033[33mSAM2 no responde en tcp://{a.seg_host}:{a.seg_port} (¿corriste start_seg.sh?); "
+                  f"el pick usará solo la depth del clic\033[0m")
+            segmenter = None
+    skills = Skills(robot, kin, table_z=a.table_z, max_qd=speed, confirm=confirm, log=log, arms=arms,
+                    segmenter=segmenter)
+    q_start = robot.arm_q()          # real robot: lowered back here on exit
+    if a.backend == "real":
+        # Raise the working arm(s) first, with the table away (the camera can't see its near edge).
+        print("Subiendo el brazo a la pose de espera (mesa lejos)...")
+        for side, sl in (("left", slice(0, 7)), ("right", slice(7, 14))):
+            if side in arms:
+                try:
+                    skills._play(side, skills.route(side, skills.ready_q[side]))
+                except SkillError as e:
+                    print(f"No subo el brazo {side}: {e}")
+                    return
+        input("Brazo arriba. Acomoda la mesa y el objeto y presiona Enter para empezar: ")
     if a.backend == "sim":
         skills.home()          # start with the hands up and out of the camera's view
 
@@ -312,6 +374,20 @@ def main():
     except (KeyboardInterrupt, EOFError):
         print(f"\nsesión terminada, costo aproximado ${session.cost:.2f}")
     finally:
+        if a.backend == "real":
+            # Once this process exits nothing commands the arms: lower them in a controlled way, via the
+            # ready pose, after the table is moved away (the camera can't see its edge near the robot).
+            try:
+                if input("\nAleja la mesa y presiona Enter para bajar el brazo a como estaba al inicio "
+                         "(q = dejarlo donde está): ").strip().lower() != "q":
+                    for side, sl in (("left", slice(0, 7)), ("right", slice(7, 14))):
+                        if side in arms:
+                            skills._play(side, skills.route(side, skills.ready_q[side]))
+                            skills._play(side, skills.route(side, q_start[sl]))
+            except (KeyboardInterrupt, EOFError):
+                pass
+            except SkillError as e:
+                print(f"No bajo el brazo automáticamente: {e}")
         robot.close()
 
 

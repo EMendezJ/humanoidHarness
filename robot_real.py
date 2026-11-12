@@ -28,7 +28,9 @@ MAX_TARGET_SPEED = 1.0                   # rad/s, hard cap inside the publisher
 
 
 class RealRobot:
-    def __init__(self, iface, cam_host, cam_port=55600, hands=True):
+    def __init__(self, iface, cam_host, cam_port=55600, hands=True, arms=("left", "right")):
+        """arms: sides allowed to move. A locked arm keeps the pose it had at start-up (same target,
+        no torque change) and a locked hand never receives a command, whatever the layers above do."""
         ChannelFactoryInitialize(0, iface)
         self._low = None
         self._lock = threading.Lock()
@@ -53,6 +55,12 @@ class RealRobot:
             c.mode, c.q, c.dq, c.tau, c.kp, c.kd = 1, float(q_now[i]), 0.0, 0.0, kp, kd
         self.target = q_now[ARM_IDS].copy()
         self.tau = np.zeros(14)
+        self.arms = tuple(arms)
+        self.locked = np.zeros(14, bool)
+        for side, sl in (("left", slice(0, 7)), ("right", slice(7, 14))):
+            if side not in self.arms:
+                self.locked[sl] = True
+        self.locked_target = self.target.copy()
         self.sent = self.target.copy()
         self.crc = CRC()
         self.pub = ChannelPublisher("rt/lowcmd", LowCmd_)
@@ -65,7 +73,7 @@ class RealRobot:
         self.hand_q = {"left": None, "right": None}
         if hands:
             self.hand_pub, self.hand_sub = {}, {}
-            for side in ("left", "right"):
+            for side in self.arms:          # locked hands get no publisher at all
                 self.hand_pub[side] = ChannelPublisher(f"rt/brainco/{side}/cmd", MotorCmds_)
                 self.hand_pub[side].Init()
                 self.hand_sub[side] = ChannelSubscriber(f"rt/brainco/{side}/state", MotorStates_)
@@ -98,7 +106,7 @@ class RealRobot:
 
     def _hand_loop(self):
         msgs = {}
-        for side in ("left", "right"):
+        for side in self.hand_pub:
             m = MotorCmds_()
             m.cmds = [unitree_go_msg_dds__MotorCmd_() for _ in range(6)]
             msgs[side] = m
@@ -114,13 +122,20 @@ class RealRobot:
         low = self._low
         return np.array([low.motor_state[i].q for i in ARM_IDS])
 
-    def command_arm(self, q14, tau14=None):
+    def arm_cmd(self):
         with self._lock:
-            self.target = np.asarray(q14, float).copy()
-            self.tau = np.zeros(14) if tau14 is None else np.asarray(tau14, float).copy()
+            return self.target.copy()
+
+    def command_arm(self, q14, tau14=None):
+        q = np.asarray(q14, float).copy()
+        tau = np.zeros(14) if tau14 is None else np.asarray(tau14, float).copy()
+        q[self.locked] = self.locked_target[self.locked]
+        tau[self.locked] = 0.0
+        with self._lock:
+            self.target, self.tau = q, tau
 
     def set_hand(self, side, q6):
-        if not self.hands:
+        if not self.hands or side not in self.arms:
             return
         self.hand_cmd[side] = np.clip(np.asarray(q6, float), 0.0, 1.0)
 
@@ -167,6 +182,7 @@ class CameraClient:
         if png:
             depth = cv2.imdecode(np.frombuffer(png, np.uint8), cv2.IMREAD_UNCHANGED).astype(np.float32) * 0.001
         K = np.array([[meta["fx"], 0, meta["cx"]], [0, meta["fy"], meta["cy"]], [0, 0, 1.0]])
+        self.meta = meta
         return rgb, depth, K
 
     def close(self):

@@ -13,12 +13,12 @@ from robot_sim import SimRobot, SCENES, TRAY_XY, TRAY_HALF
 from skills import Skills, SkillError, annotate
 
 
-def run(seed, scene, save_dir=None, video=None):
+def run(seed, scene, save_dir=None, video=None, seg=None, grasp="arriba"):
     kin = G1Kinematics()
     robot = SimRobot(kin, seed=seed, scene=scene)
     if video:
         robot.start_recording(video)
-    sk = Skills(robot, kin, max_qd=0.5, log=lambda s: setattr(robot, "caption", s))
+    sk = Skills(robot, kin, max_qd=0.5, log=lambda s: setattr(robot, "caption", s), segmenter=seg)
     sent = []
     command = robot.command_arm
     robot.command_arm = lambda q, tau=None: (sent.append(np.array(q)), command(q, tau))
@@ -30,7 +30,8 @@ def run(seed, scene, save_dir=None, video=None):
         u, v = project(kin.pelvis_to_cam(p), robot.K)
         tu, tv = project(kin.pelvis_to_cam(np.array([TRAY_XY[0] + dx, TRAY_XY[1] + dy, 0.0])), robot.K)
         try:
-            sk.pick(int(round(u)), int(round(v)), "auto", name)
+            msg, _ = sk.pick(int(round(u)), int(round(v)), "auto", name, grasp)
+            print("   ", msg)
             sk.place(int(round(tu)), int(round(tv)), "auto")
             robot.sleep(1.0)
             q = robot.object_positions()[name]
@@ -53,13 +54,20 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--seeds", type=int, default=3)
     ap.add_argument("--save-dir")
+    ap.add_argument("--scenes", help="lista separada por comas (default: todas)")
+    ap.add_argument("--grasp", default="arriba", choices=["arriba", "lado"])
+    ap.add_argument("--seg-host", help="servidor SAM2 (segment.py serve) para el pick")
     ap.add_argument("--video", help="graba la primera semilla de cada escena: <video>_<escena>.mp4")
     a = ap.parse_args()
     total = ok = 0
-    for scene in SCENES:
+    seg = None
+    if a.seg_host:
+        from segment import SegClient
+        seg = SegClient(a.seg_host)
+    for scene in (a.scenes.split(",") if a.scenes else [s for s in SCENES if SCENES[s]]):
         for seed in range(a.seeds):
             video = f"{os.path.splitext(a.video)[0]}_{scene}.mp4" if a.video and seed == 0 else None
-            for name, inside, info in run(seed, scene, a.save_dir, video):
+            for name, inside, info in run(seed, scene, a.save_dir, video, seg, a.grasp):
                 total += 1
                 ok += inside
                 print(f"{scene} seed {seed} {name:16s} {'OK ' if inside else 'FAIL'} {info}")
